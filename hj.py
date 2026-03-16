@@ -1,235 +1,244 @@
-import os
+﻿from __future__ import annotations
+
+import argparse
 import time
-import urllib.request
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from openai import OpenAI
-from typing import Dict, List, Optional
-import argparse
+from typing import Optional
+
 import prompts
+from analysis_service import (
+    AnalyzeRequest,
+    AnalysisResult,
+    BatchAnalysisResult,
+    DEFAULT_SAVE_DIR,
+    ModelConfig,
+    run_analysis_sync,
+)
 
-class Paper_Assistant:
-    client = OpenAI(
-        # 建议通过环境变量配置 API KEY，防止代码泄露
-        api_key=os.environ.get("DASHSCOPE_API_KEY", ""),  
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",  
-    )
 
-    def __init__(self, paper_directory=None, analyze_file=None, output_folder="D:\Papers MAS\graph learning\\ai_notes"):
-        self.paper_directory = paper_directory
-        self.analyze_file = analyze_file
-        self.output_folder = output_folder
-        
-        Path(self.output_folder).mkdir(parents=True, exist_ok=True)
+def download_from_arxiv(keyword: str, max_results: int, download_dir: str) -> Optional[str]:
+    """Search arXiv, download selected PDFs, and return the folder path."""
 
-    def download_from_arxiv(self, keyword: str, max_results: int, download_dir: str) -> Optional[str]:
-        """
-        调用 arXiv API 检索关键词，展示论文信息并让用户选择是否下载
-        """
-        folder = Path(download_dir)
-        folder.mkdir(parents=True, exist_ok=True)
-        
-        query = urllib.parse.quote(keyword)
-        url = f'http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={max_results}'
-        
-        print(f"\n[*] 正在 arXiv 检索关键词: '{keyword}'，最多获取 {max_results} 篇...\n")
-        
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            response = urllib.request.urlopen(req)
-            xml_data = response.read()
-        except Exception as e:
-            print(f"[!] 请求 arXiv API 失败: {e}")
-            return None
+    folder = Path(download_dir)
+    folder.mkdir(parents=True, exist_ok=True)
 
-        # arXiv API 使用 Atom 和自定义的 arxiv 命名空间
-        root = ET.fromstring(xml_data)
-        ns = {
-            'atom': 'http://www.w3.org/2005/Atom',
-            'arxiv': 'http://arxiv.org/schemas/atom'
-        }
-        entries = root.findall('atom:entry', ns)
+    query = urllib.parse.quote(keyword)
+    url = f"http://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={max_results}"
+    print(f"\n[*] 正在 arXiv 检索关键词: '{keyword}'，最多获取 {max_results} 篇...\n")
 
-        if not entries:
-            print("[-] 未检索到相关论文。")
-            return None
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        response = urllib.request.urlopen(request)
+        xml_data = response.read()
+    except Exception as exc:
+        print(f"[!] 请求 arXiv API 失败: {exc}")
+        return None
 
-        downloaded_any = False
+    root = ET.fromstring(xml_data)
+    namespaces = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+    entries = root.findall("atom:entry", namespaces)
+    if not entries:
+        print("[-] 未检索到相关论文。")
+        return None
 
-        for entry in entries:
-            # 1. 提取基础信息
-            raw_title = entry.find('atom:title', ns).text.replace('\n', ' ').strip()
-            published = entry.find('atom:published', ns).text[:10]  # 取 YYYY-MM-DD 格式
-            
-            authors = [author.find('atom:name', ns).text for author in entry.findall('atom:author', ns)]
-            authors_str = ", ".join(authors)
-            
-            # 2. 尝试获取期刊或会议信息
-            journal_ref_elem = entry.find('arxiv:journal_ref', ns)
-            comment_elem = entry.find('arxiv:comment', ns)
-            
-            if journal_ref_elem is not None:
-                journal_info = journal_ref_elem.text
-            elif comment_elem is not None:
-                journal_info = f"备注: {comment_elem.text}"
-            else:
-                journal_info = "未提供 (通常为预印本)"
+    downloaded_any = False
+    for entry in entries:
+        raw_title = entry.find("atom:title", namespaces).text.replace("\n", " ").strip()
+        published = entry.find("atom:published", namespaces).text[:10]
+        authors = [
+            author.find("atom:name", namespaces).text
+            for author in entry.findall("atom:author", namespaces)
+        ]
+        journal_ref = entry.find("arxiv:journal_ref", namespaces)
+        comment = entry.find("arxiv:comment", namespaces)
+        journal_info = "未提供 (通常为预印本)"
+        if journal_ref is not None:
+            journal_info = journal_ref.text
+        elif comment is not None:
+            journal_info = f"备注: {comment.text}"
 
-            # 3. 打印信息并请求用户输入
-            print("-" * 60)
-            print(f"标题: {raw_title}")
-            print(f"作者: {authors_str}")
-            print(f"时间: {published}")
-            print(f"期刊/会议: {journal_info}")
-            print("-" * 60)
-            
-            choice = input("是否下载并分析这篇论文？(y/n/q 退出检索): ").strip().lower()
-            
-            if choice == 'q':
-                print("[*] 已退出下载环节。")
-                break
-            elif choice != 'y':
-                print("[-] 跳过该论文。\n")
-                continue
+        print("-" * 60)
+        print(f"标题: {raw_title}")
+        print(f"作者: {', '.join(authors)}")
+        print(f"时间: {published}")
+        print(f"期刊/会议: {journal_info}")
+        print("-" * 60)
 
-            # 4. 执行下载逻辑
-            safe_title = "".join([c for c in raw_title if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).strip()
-            if not safe_title:
-                id_element = entry.find('atom:id', ns)
-                safe_title = id_element.text.split('/')[-1] if id_element is not None else f"arxiv_paper_{int(time.time())}"
-            
-            pdf_link = None
-            for link in entry.findall('atom:link', ns):
-                if link.attrib.get('title') == 'pdf':
-                    pdf_link = link.attrib.get('href')
-                    break
-            
-            if pdf_link:
-                pdf_url = pdf_link + '.pdf' if not pdf_link.endswith('.pdf') else pdf_link
-                file_path = folder / f"{safe_title}.pdf"
-                
-                if file_path.exists():
-                    print(f"[-] 文件已存在: {safe_title}.pdf\n")
-                    downloaded_any = True
-                    continue
-                    
-                print(f"[*] 正在下载...")
-                try:
-                    req = urllib.request.Request(pdf_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req) as response_pdf, open(file_path, 'wb') as out_file:
-                        out_file.write(response_pdf.read())
-                    print(f"[+] 下载成功: {safe_title}.pdf\n")
-                    downloaded_any = True
-                    time.sleep(2)  # 防止请求过快
-                except Exception as e:
-                    print(f"[!] 下载失败: {e}\n")
+        choice = input("是否下载并分析这篇论文？(y/n/q 退出检索): ").strip().lower()
+        if choice == "q":
+            print("[*] 已退出下载环节。")
+            break
+        if choice != "y":
+            print("[-] 跳过该论文。\n")
+            continue
 
-        return str(folder) if downloaded_any else None
-
-    def process_directory(self) -> List[Dict]:
-        file_list = []
-        dir_path = Path(self.paper_directory)
-        if not dir_path.exists():
-            raise FileNotFoundError(f"目录不存在: {dir_path}")
-        
-        print(f"[*] 开始将 {dir_path} 中的 PDF 上传至云端解析...")
-        for file_path in dir_path.rglob("*.pdf"):
-            try:
-                file_object = self.client.files.create(file=Path(file_path), purpose="file-extract")
-                file_list.append((file_object, file_path.name))
-                print(f"[+] 成功解析: {file_path.name}")
-            except Exception as e:
-                print(f"[!] 处理文件 {file_path} 失败: {str(e)}")
-
-        return file_list
-
-    def process_single_file(self):
-        try:
-            print(f"[*] 开始上传并解析单文件: {self.analyze_file}...")
-            file_object = self.client.files.create(file=Path(self.analyze_file), purpose="file-extract")
-            return file_object
-        except Exception as e:
-            print(f"[!] 处理文件失败: {str(e)}")
-            return None
-
-    def get_unique_filename(self, base_filename, extension):
-        folder = Path(self.output_folder)
-        counter = 1
-        new_filename = f"{base_filename}{extension}"
-        file_path = folder / new_filename
-        
-        while file_path.exists():
-            new_filename = f"{base_filename}_{counter}{extension}"
-            file_path = folder / new_filename
-            counter += 1
-        
-        return file_path
-
-    def analyze_and_generate_report(self, file_id, original_filename, user_prompt):
-        try:
-            print(f"[*] 正在生成报告: {original_filename} ...")
-            completion = self.client.chat.completions.create(
-                model="qwen-long",
-                messages=[
-                    {'role': 'system', 'content': 'You are a helpful assistant.'},
-                    {'role': 'system', 'content': f'fileid://{file_id}'},
-                    {'role': 'user', 'content': user_prompt}
-                ],
-                stream=True,
-                stream_options={"include_usage": True}
+        safe_title = "".join(
+            character
+            for character in raw_title
+            if character.isalpha() or character.isdigit() or character in (" ", "-", "_")
+        ).strip()
+        if not safe_title:
+            paper_id = entry.find("atom:id", namespaces)
+            safe_title = (
+                paper_id.text.split("/")[-1]
+                if paper_id is not None
+                else f"arxiv_paper_{int(time.time())}"
             )
 
-            full_content = ""
-            for chunk in completion:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    full_content += chunk.choices[0].delta.content
+        pdf_link = None
+        for link in entry.findall("atom:link", namespaces):
+            if link.attrib.get("title") == "pdf":
+                pdf_link = link.attrib.get("href")
+                break
+        if not pdf_link:
+            continue
 
-            if full_content:
-                note_path = self.get_unique_filename(f"{original_filename}_report", ".md")
-                with open(note_path, 'w', encoding='utf-8') as f:
-                    f.write(full_content)
-                print(f"[+] 已成功生成并保存报告: {note_path}\n")
-            else:
-                print(f"[-] 未能生成报告: {original_filename}\n")
+        pdf_url = pdf_link if pdf_link.endswith(".pdf") else f"{pdf_link}.pdf"
+        file_path = folder / f"{safe_title}.pdf"
+        if file_path.exists():
+            print(f"[-] 文件已存在: {file_path.name}\n")
+            downloaded_any = True
+            continue
 
-        except Exception as e:
-            print(f"[!] 分析 {original_filename} 时发生错误: {str(e)}\n")
+        print("[*] 正在下载...")
+        try:
+            pdf_request = urllib.request.Request(pdf_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(pdf_request) as response_pdf, file_path.open("wb") as output:
+                output.write(response_pdf.read())
+            print(f"[+] 下载成功: {file_path.name}\n")
+            downloaded_any = True
+            time.sleep(2)
+        except Exception as exc:
+            print(f"[!] 下载失败: {exc}\n")
 
-def main():
+    return str(folder) if downloaded_any else None
+
+
+def resolve_prompt_argument(prompt_value: str) -> str:
+    """Resolve CLI prompt input from a symbol, path, or inline text."""
+
+    if not prompt_value:
+        return prompts.thoroughly2
+    prompt_path = Path(prompt_value)
+    if prompt_path.is_file():
+        return prompt_path.read_text(encoding="utf-8")
+    return getattr(prompts, prompt_value, prompt_value)
+
+
+def build_model_config(args: argparse.Namespace) -> ModelConfig:
+    """Create the shared model config object from CLI arguments."""
+
+    return ModelConfig(
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        api_key_env=args.api_key_env,
+    )
+
+
+def print_result_summary(result: BatchAnalysisResult | AnalysisResult) -> None:
+    """Print a concise CLI summary for the generated analysis results."""
+
+    if isinstance(result, BatchAnalysisResult):
+        print(f"[*] 批量分析完成，共处理 {len(result.results)} 篇论文。")
+        for item in result.results:
+            if item.error:
+                print(f"[!] {item.filename} 失败: {item.error}")
+                continue
+            print(
+                f"[+] {item.filename} -> {item.report_path} "
+                f"(评分状态: {item.score_status}, 模型: {item.provider}/{item.model})"
+            )
+        if result.summary_csv_path:
+            print(f"[*] 评分汇总已保存: {result.summary_csv_path}")
+        return
+
+    if result.error:
+        print(f"[!] 分析失败: {result.error}")
+        return
+
+    print(f"[+] 报告已保存: {result.report_path}")
+    print(f"[*] 模型: {result.provider}/{result.model}")
+    print(f"[*] 评分状态: {result.score_status}")
+    if result.score and result.score_status == "succeeded":
+        print(f"[*] 总分: {result.score['total_score']} / 50")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="论文检索与智能分析工具")
-    parser.add_argument('--file', default=None, type=str, help="单个pdf文件路径")
-    parser.add_argument('--folder', default=None, type=str, help="多个pdf文件的文件夹路径")
-    parser.add_argument('--p', default=getattr(prompts, 'thoroughly2', '请总结这篇论文'), type=str, help="提示词内容或路径")
-    parser.add_argument('--save', default="D:\Papers MAS\graph learning\\gnnllm_notes", type=str, help="保存路径")
-    parser.add_argument('--query', default=None, type=str, help="arXiv检索关键词")
-    parser.add_argument('--max_papers', default=3, type=int, help="从arXiv检索的最大论文数量")
-    parser.add_argument('--arxiv_dir', default="./arxiv_downloads", type=str, help="arXiv论文的临时下载目录")
+    parser.add_argument("--file", default=None, type=str, help="单个 pdf 文件路径")
+    parser.add_argument("--folder", default=None, type=str, help="多个 pdf 文件的文件夹路径")
+    parser.add_argument(
+        "--p",
+        default="thoroughly2",
+        type=str,
+        help="提示词名称、提示词文件路径或直接传入的提示词内容",
+    )
+    parser.add_argument("--save", default=str(DEFAULT_SAVE_DIR), type=str, help="报告保存路径")
+    parser.add_argument("--query", default=None, type=str, help="arXiv 检索关键词")
+    parser.add_argument("--max_papers", default=3, type=int, help="从 arXiv 检索的最大论文数量")
+    parser.add_argument("--arxiv_dir", default="./arxiv_downloads", type=str, help="arXiv 下载目录")
+    parser.add_argument(
+        "--provider",
+        default="dashscope",
+        type=str,
+        help="模型 provider: dashscope/openai/deepseek/custom",
+    )
+    parser.add_argument("--model", default=None, type=str, help="模型名称")
+    parser.add_argument("--base-url", default=None, type=str, help="覆盖 provider 的 base_url")
+    parser.add_argument("--api-key", default=None, type=str, help="直接传入 API key")
+    parser.add_argument("--api-key-env", default=None, type=str, help="从指定环境变量读取 API key")
+    parser.add_argument("--score", action="store_true", help="启用文献评分")
 
     args = parser.parse_args()
+    prompt_text = resolve_prompt_argument(args.p)
+    model_config = build_model_config(args)
 
-    ass = Paper_Assistant(paper_directory=args.folder, analyze_file=args.file, output_folder=args.save)
-    
+    folder_path = args.folder
     if args.query:
-        downloaded_folder = ass.download_from_arxiv(args.query, args.max_papers, args.arxiv_dir)
-        if downloaded_folder:
-            ass.paper_directory = downloaded_folder
-        else:
+        downloaded_folder = download_from_arxiv(args.query, args.max_papers, args.arxiv_dir)
+        if not downloaded_folder:
             print("[*] 没有下载任何论文，程序结束。")
             return
-    
-    if ass.paper_directory:
-        file_list = ass.process_directory()
-        for file_object, original_filename in file_list:
-            ass.analyze_and_generate_report(file_object.id, original_filename, args.p)
-            
-    elif ass.analyze_file:
-        file_object = ass.process_single_file()
-        if file_object:
-            original_filename = Path(args.file).name
-            ass.analyze_and_generate_report(file_object.id, original_filename, args.p)
+        folder_path = downloaded_folder
+
+    if folder_path:
+        request = AnalyzeRequest(
+            source_type="folder_path",
+            folder_path=folder_path,
+            prompt=prompt_text,
+            save_dir=args.save,
+            enable_score=args.score,
+            model_config=model_config,
+        )
+    elif args.file:
+        request = AnalyzeRequest(
+            source_type="file_path",
+            file_path=args.file,
+            prompt=prompt_text,
+            save_dir=args.save,
+            enable_score=args.score,
+            model_config=model_config,
+        )
     else:
         print("请提供 --query、--folder 或 --file 参数来启动工具！")
+        return
+
+    try:
+        result = run_analysis_sync(request)
+    except Exception as exc:
+        print(f"[!] 执行失败: {exc}")
+        return
+
+    print_result_summary(result)
+
 
 if __name__ == "__main__":
     main()
