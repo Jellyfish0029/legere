@@ -35,9 +35,8 @@ pip install -r requirements.txt
 # 大模型 API Key (例如 OpenAI 或 Gemini)
 LLM_API_KEY="your_api_key_here"
 
-# 默认文献 PDF 存储路径与 ChromaDB 存储路径
-PAPER_STORAGE_DIR="./data/pdf_files"
-VECTOR_DB_PATH="./data/chroma_db"
+# 如果使用特定的代理或自定义模型，可在此处配置 Base URL
+# LLM_BASE_URL="[https://api.your-provider.com/v1]"
 ```
 
 ## 🚀 使用方法
