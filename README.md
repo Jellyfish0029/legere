@@ -40,7 +40,8 @@ PAPER_STORAGE_DIR="./data/pdf_files"
 VECTOR_DB_PATH="./data/chroma_db"
 ```
 
-##🚀使用方法
+## 🚀 使用方法
+
 启用web交互界面
 **在终端中执行以下命令以启动前端服务**
 ```bash
